@@ -710,3 +710,88 @@ describe('collectTags', () => {
     expect(gen.collectTags(undefined)).toEqual([]);
   });
 });
+
+describe('pascalCase', () => {
+  it('converts snake_case discriminator values', () => {
+    expect(gen.pascalCase('user_connection')).toBe('UserConnection');
+    expect(gen.pascalCase('message')).toBe('Message');
+  });
+});
+
+describe('literalPropertyValue', () => {
+  beforeEach(() => {
+    gen.registry = new ComponentRegistry();
+  });
+
+  it('reads single-value enums and consts', () => {
+    expect(gen.literalPropertyValue({ properties: { type: { enum: ['a'] } } }, 'type')).toBe('a');
+    expect(gen.literalPropertyValue({ properties: { type: { const: 'b' } } }, 'type')).toBe('b');
+  });
+
+  it('returns null for multi-value enums and missing properties', () => {
+    expect(gen.literalPropertyValue({ properties: { type: { enum: ['a', 'b'] } } }, 'type')).toBe(
+      null,
+    );
+    expect(gen.literalPropertyValue({ properties: {} }, 'type')).toBe(null);
+  });
+
+  it('follows $refs and allOf branches', () => {
+    gen.registry.schemas.Base = { properties: { type: { enum: ['base'] } } };
+    gen.registry.schemas.Child = { allOf: [{ $ref: '#/components/schemas/Base' }, {}] };
+    expect(gen.literalPropertyValue({ $ref: '#/components/schemas/Child' }, 'type')).toBe('base');
+  });
+
+  it('does not loop on recursive refs', () => {
+    gen.registry.schemas.Loop = { allOf: [{ $ref: '#/components/schemas/Loop' }] };
+    expect(gen.literalPropertyValue({ $ref: '#/components/schemas/Loop' }, 'type')).toBe(null);
+  });
+});
+
+describe('buildDiscriminatedUnion', () => {
+  const ref = (name) => ({ $ref: `#/components/schemas/${name}` });
+
+  beforeEach(() => {
+    gen.registry = new ComponentRegistry();
+    Object.assign(gen.registry.schemas, {
+      Mention: { properties: { type: { enum: ['app_mention'] } } },
+      PlainMessage: { properties: { type: { enum: ['message'] } } },
+      BotMessage: { properties: { type: { enum: ['message'] }, subtype: { enum: ['bot'] } } },
+      Untyped: { properties: { foo: { type: 'string' } } },
+    });
+  });
+
+  it('maps each unique discriminator value to its schema, sorted', () => {
+    const union = gen.buildDiscriminatedUnion(
+      [ref('PlainMessage'), ref('Mention')],
+      'type',
+      (v) => `${v}Group`,
+    );
+    expect(union.oneOf).toEqual([ref('Mention'), ref('PlainMessage')]);
+    expect(union.discriminator).toEqual({
+      propertyName: 'type',
+      mapping: {
+        app_mention: '#/components/schemas/Mention',
+        message: '#/components/schemas/PlainMessage',
+      },
+    });
+  });
+
+  it('groups members that share a discriminator value into a nested oneOf component', () => {
+    const union = gen.buildDiscriminatedUnion(
+      [ref('PlainMessage'), ref('BotMessage'), ref('Mention')],
+      'type',
+      (v) => `${gen.pascalCase(v)}Variants`,
+    );
+    expect(union.discriminator.mapping.message).toBe('#/components/schemas/MessageVariants');
+    expect(gen.registry.schemas.MessageVariants.oneOf).toEqual([
+      ref('PlainMessage'),
+      ref('BotMessage'),
+    ]);
+  });
+
+  it('keeps members without a literal discriminator, unmapped, at the end', () => {
+    const union = gen.buildDiscriminatedUnion([ref('Untyped'), ref('Mention')], 'type', (v) => v);
+    expect(union.oneOf).toEqual([ref('Mention'), ref('Untyped')]);
+    expect(Object.keys(union.discriminator.mapping)).toEqual(['app_mention']);
+  });
+});

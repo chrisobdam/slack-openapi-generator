@@ -683,77 +683,209 @@ function parseWebApi(project) {
   return paths;
 }
 
-// Parse Events, Actions, and Shortcuts into OpenAPI webhook operations.
-function parseEventsApi(project) {
-  const allInterfaces = project.getSourceFiles().flatMap((f) => f.getInterfaces());
+// Find an exported type alias or interface by name in a source file whose path contains `pathFragment`.
+function findDeclaration(project, name, pathFragment) {
+  for (const file of project.getSourceFiles()) {
+    if (!file.getFilePath().includes(pathFragment)) continue;
+    const decl = file.getTypeAlias(name) || file.getInterface(name);
+    if (decl && decl.isExported()) return decl;
+  }
+  throw new Error(`Could not find exported type ${name} in ${pathFragment}`);
+}
 
-  // Build a set of abstract base types used as generic constraints/defaults
-  const abstractBaseTypes = new Set();
-  for (const iface of allInterfaces) {
-    for (const tp of iface.getTypeParameters()) {
-      const constraint = tp.getConstraint();
-      if (constraint) abstractBaseTypes.add(constraint.getText().replace(/<.*>$/, ''));
-      const defaultType = tp.getDefault();
-      if (defaultType) abstractBaseTypes.add(defaultType.getText().replace(/<.*>$/, ''));
-    }
+// Map every member of a union type alias to a schema ($ref for named members), without duplicates.
+function mapUnionMembers(alias) {
+  const type = alias.getType();
+  const members = type.isUnion() ? type.getUnionTypes() : [type];
+  return dedup(members.map((member) => mapTsTypeToOpenApi(member, alias, 0)));
+}
+
+// Read the single literal value of `propertyName` from a schema (following $refs and allOf),
+// or null when the property isn't a single-value enum/const.
+function literalPropertyValue(schema, propertyName, seen = new Set()) {
+  if (!schema) return null;
+  if (schema.$ref) {
+    const name = schema.$ref.split('/').pop();
+    if (seen.has(name)) return null;
+    seen.add(name);
+    return literalPropertyValue(registry.schemas[name], propertyName, seen);
+  }
+  const prop = schema.properties?.[propertyName];
+  if (prop?.const !== undefined) return prop.const;
+  if (prop?.enum?.length === 1) return prop.enum[0];
+  for (const branch of schema.allOf || []) {
+    const value = literalPropertyValue(branch, propertyName, seen);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+// snake_case → PascalCase, for naming generated union components.
+function pascalCase(value) {
+  return String(value)
+    .split(/[^a-zA-Z0-9]+/)
+    .filter(Boolean)
+    .map((part) => part[0].toUpperCase() + part.slice(1))
+    .join('');
+}
+
+// Build a `oneOf` with a `discriminator` on `propertyName`. Members that share a discriminator
+// value (e.g. the 17 `message` subtypes) are grouped into a nested `oneOf` component named by
+// `groupName(value)`, since discriminator mappings must be unique.
+function buildDiscriminatedUnion(members, propertyName, groupName) {
+  const groups = new Map();
+  const unkeyed = [];
+  for (const member of members) {
+    const value = literalPropertyValue(member, propertyName);
+    if (value === null) unkeyed.push(member);
+    else if (groups.has(value)) groups.get(value).push(member);
+    else groups.set(value, [member]);
+  }
+  if (unkeyed.length > 0) {
+    console.warn(`⚠️  ${unkeyed.length} union member(s) have no literal \`${propertyName}\``);
   }
 
-  const webhooks = {};
-  for (const interfaceNode of allInterfaces) {
-    const interfaceName = interfaceNode.getName();
-    const filePath = interfaceNode.getSourceFile().getFilePath();
+  const oneOf = [];
+  const mapping = {};
+  for (const value of [...groups.keys()].sort()) {
+    const variants = groups.get(value);
+    let target = variants[0];
+    if (variants.length > 1) {
+      const name = groupName(value);
+      registry.schemas[name] = {
+        description: `Payloads with \`${propertyName}: "${value}"\`, distinguished by their other fields (such as \`subtype\`).`,
+        oneOf: variants,
+      };
+      target = { $ref: `#/components/schemas/${name}` };
+    }
+    oneOf.push(target);
+    if (target.$ref) mapping[value] = target.$ref;
+  }
+  oneOf.push(...unkeyed);
+  return { oneOf, discriminator: { propertyName, mapping } };
+}
 
-    const isEvent = filePath.includes('/events/') && interfaceName.endsWith('Event');
-    const isAction =
-      (filePath.includes('/actions/') || filePath.includes('/view/')) &&
-      interfaceName.endsWith('Action');
-    const isShortcut = filePath.includes('/shortcuts/') && interfaceName.endsWith('Shortcut');
-    if (!isEvent && !isAction && !isShortcut) continue;
-    if (abstractBaseTypes.has(interfaceName)) continue;
+const schemaRef = (name) => ({ $ref: `#/components/schemas/${name}` });
 
-    // Register the type as a component (even generic wrappers like EnvelopedEvent)
-    const eventSchema = mapTsTypeToOpenApi(interfaceNode.getType(), interfaceNode, 0);
+// Slack sends every Events API payload to a single Request URL as JSON, so all events are
+// modelled as one webhook whose body is a discriminated union.
+function buildEventsWebhook(project) {
+  const envelope = findDeclaration(project, 'EnvelopedEvent', '@slack/bolt/');
+  mapTsTypeToOpenApi(envelope.getType(), envelope, 0); // registers EnvelopedEvent
 
-    // Skip generic types — they aren't concrete Slack payloads
-    if (interfaceNode.getTypeParameters().length > 0) continue;
+  // app_rate_limited is part of the SDK's SlackEvent union, but Slack sends it as a top-level
+  // payload rather than wrapped in an event_callback envelope.
+  const allEvents = mapUnionMembers(findDeclaration(project, 'SlackEvent', '@slack/types/'));
+  const isRateLimited = (m) => literalPropertyValue(m, 'type') === 'app_rate_limited';
+  const rateLimited = allEvents.filter(isRateLimited);
+  const events = allEvents.filter((m) => !isRateLimited(m));
 
-    const eventName = interfaceName
-      .replace(/(Event|Action|Shortcut)$/, '')
-      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
-      .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-      .toLowerCase();
-    const payloadType = isEvent ? 'Event' : isAction ? 'Action' : 'Shortcut';
+  registry.schemas.SlackEvent = {
+    description: 'Any event Slack can deliver inside an `event_callback` envelope.',
+    ...buildDiscriminatedUnion(events, 'type', (v) => `${pascalCase(v)}EventVariants`),
+  };
+  registry.schemas.EventCallback = {
+    description: 'An event wrapped in the standard Events API envelope.',
+    allOf: [
+      schemaRef('EnvelopedEvent'),
+      {
+        type: 'object',
+        properties: { event: schemaRef('SlackEvent') },
+        required: ['event'],
+      },
+    ],
+  };
+  // Not in the SDK types: Slack's one-time handshake when a Request URL is configured.
+  registry.schemas.UrlVerification = {
+    type: 'object',
+    description:
+      'Sent once when the Request URL is configured. Respond with the `challenge` value.',
+    properties: {
+      type: { type: 'string', enum: ['url_verification'] },
+      token: { type: 'string' },
+      challenge: { type: 'string' },
+    },
+    required: ['type', 'token', 'challenge'],
+  };
 
-    const bodySchema = isEvent
-      ? {
-          allOf: [
-            { $ref: '#/components/schemas/EnvelopedEvent' },
-            {
-              type: 'object',
-              properties: { event: eventSchema },
-              required: ['event'],
-            },
-          ],
-        }
-      : eventSchema;
+  const body = buildDiscriminatedUnion(
+    [schemaRef('EventCallback'), schemaRef('UrlVerification'), ...rateLimited],
+    'type',
+    (v) => `${pascalCase(v)}Variants`,
+  );
+  // The EventCallback branch's `type` comes from EnvelopedEvent; map it explicitly.
+  body.discriminator.mapping.event_callback = schemaRef('EventCallback').$ref;
 
-    webhooks[eventName] = {
-      post: {
-        operationId: `webhook.${eventName}`,
-        tags: [payloadType.toLowerCase() + 's'],
-        summary: `Slack sends a ${eventName} ${payloadType.toLowerCase()}`,
-        description: `Triggered when the \`${eventName}\` ${payloadType.toLowerCase()} occurs in Slack.`,
-        requestBody: {
-          required: true,
-          content: { 'application/json': { schema: bodySchema } },
-        },
-        responses: {
-          200: { description: 'Acknowledge the event successfully.' },
+  return {
+    post: {
+      operationId: 'webhook.slackEvent',
+      tags: ['events'],
+      summary: 'Events API request',
+      description: `Slack posts every subscribed event to your app's Events API Request URL. The \`type\` field tells the payload apart: \`event_callback\` wraps one of ${events.length} events (see \`SlackEvent\`, discriminated by \`event.type\`), \`url_verification\` is the setup handshake, and \`app_rate_limited\` reports dropped events.`,
+      requestBody: {
+        required: true,
+        content: { 'application/json': { schema: body } },
+      },
+      responses: {
+        200: {
+          description:
+            'Acknowledge within 3 seconds. For `url_verification`, respond with the `challenge` value.',
         },
       },
-    };
-  }
-  return webhooks;
+    },
+  };
+}
+
+// Slack sends block actions, view submissions, shortcuts and dialogs to a single Interactivity
+// Request URL, form-encoded with the JSON in a `payload` field.
+function buildInteractivityWebhook(project) {
+  const unions = ['SlackAction', 'SlackViewAction', 'SlackShortcut'];
+  const members = dedup(
+    unions.flatMap((name) => mapUnionMembers(findDeclaration(project, name, '@slack/bolt/'))),
+  );
+  registry.schemas.SlackInteractionPayload = {
+    description: 'Any interaction payload Slack can send to the Interactivity Request URL.',
+    ...buildDiscriminatedUnion(members, 'type', (v) => `${pascalCase(v)}PayloadVariants`),
+  };
+  const responseActionAlias = findDeclaration(project, 'ViewResponseAction', '@slack/bolt/');
+  const responseAction = mapTsTypeToOpenApi(responseActionAlias.getType(), responseActionAlias, 0);
+
+  return {
+    post: {
+      operationId: 'webhook.slackInteraction',
+      tags: ['interactivity'],
+      summary: 'Interactivity request',
+      description: `Slack posts block actions, view submissions and closures, shortcuts and legacy dialog/message actions to your app's Interactivity Request URL. The body is form-encoded with a single \`payload\` field holding JSON; its \`type\` field tells the ${members.length} payload kinds apart.`,
+      requestBody: {
+        required: true,
+        content: {
+          'application/x-www-form-urlencoded': {
+            schema: {
+              type: 'object',
+              properties: { payload: schemaRef('SlackInteractionPayload') },
+              required: ['payload'],
+            },
+            encoding: { payload: { contentType: 'application/json' } },
+          },
+        },
+      },
+      responses: {
+        200: {
+          description:
+            'Acknowledge within 3 seconds with an empty body. For `view_submission`, you may instead return a `response_action`.',
+          content: { 'application/json': { schema: responseAction } },
+        },
+      },
+    },
+  };
+}
+
+// Build the two webhooks Slack delivers to: the Events API and Interactivity Request URLs.
+function parseEventsApi(project) {
+  return {
+    slackEvent: buildEventsWebhook(project),
+    slackInteraction: buildInteractivityWebhook(project),
+  };
 }
 
 // Collect every tag used by Web API operations into a sorted top-level tag list, so OpenAPI
@@ -837,7 +969,9 @@ async function generate() {
   fs.writeFileSync(outputPath, JSON.stringify(finalSpec, null, 2));
   console.log(`\n📊 Generation Summary:`);
   console.log(`✅ Successfully mapped: ${Object.keys(paths).length} Web API Endpoints`);
-  console.log(`✅ Successfully mapped: ${Object.keys(webhooks).length} Events API Webhooks`);
+  console.log(
+    `✅ Successfully mapped: ${Object.keys(webhooks).length} webhooks (${registry.schemas.SlackEvent.oneOf.length} event types, ${registry.schemas.SlackInteractionPayload.oneOf.length} interaction types)`,
+  );
   console.log(`🎉 Success! Wrote beautiful OpenAPI 3.1 spec to ${outputPath}`);
 }
 
@@ -861,6 +995,9 @@ module.exports = {
   mapTsTypeToOpenApi,
   hasBinaryFields,
   collectTags,
+  literalPropertyValue,
+  buildDiscriminatedUnion,
+  pascalCase,
   // Allow tests to swap the module-level registry
   get registry() {
     return registry;
