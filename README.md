@@ -17,7 +17,7 @@ This tool doesn't scrape documentation or guess at types. Using [ts-morph](https
 The generated spec includes:
 
 - **Web API endpoints** (paths) — extracted from the SDK's `Methods` class
-- **Events, Actions, and Shortcuts** (webhooks) — extracted from Bolt's type definitions
+- **Webhooks** — two, matching the two URLs Slack posts to: `slackEvent` (Events API Request URL) and `slackInteraction` (Interactivity Request URL: block actions, view submissions, shortcuts). Each request body is a `oneOf` with a `discriminator` on `type`
 
 ## Getting the Schema
 
@@ -54,7 +54,7 @@ npm test
 2. **Walk the Methods class** — the SDK's `Methods` class declares every API endpoint as a typed property. The generator recursively walks the property tree, finding leaf methods typed as `MethodWithRequiredArgument<Args, Response>` or `MethodWithOptionalArgument<Args, Response>`
 3. **Map TypeScript to OpenAPI** — each type is recursively converted: literals become enums, unions become `anyOf` (with optimizations like enum collapsing and common property hoisting), intersections become `allOf` with inline object squashing, and named types become `$ref` components
 4. **Disambiguate** — when two different types share the same name (e.g., bolt's `Authorization` vs web-api's `Authorization`), the registry detects the collision and assigns numbered variants
-5. **Parse events** — interfaces ending in `Event`, `Action`, or `Shortcut` from the appropriate SDK directories become webhook definitions, wrapped in the `EnvelopedEvent` envelope where appropriate
+5. **Build webhooks** — the SDK's own unions (`SlackEvent` from `@slack/types`; `SlackAction`, `SlackViewAction` and `SlackShortcut` from Bolt) become `SlackEvent` and `SlackInteractionPayload` components: a `oneOf` with a `discriminator` on `type`. Members that share a `type` (such as the `message` subtypes) are grouped into a nested `oneOf` (e.g. `MessageEventVariants`). Events are wrapped in the `EnvelopedEvent` envelope (`EventCallback`), alongside `url_verification` and `app_rate_limited`
 
 ## Contributing
 
